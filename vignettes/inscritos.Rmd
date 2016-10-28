@@ -1,0 +1,179 @@
+---
+title: "Análise descritiva dos inscritos"
+author: "Julio Trecenti - CONRE-3"
+date: "`r Sys.Date()`"
+output: html_notebook
+vignette: >
+  %\VignetteIndexEntry{Julio Trecenti}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+### Load
+
+```{r leitura, warning=FALSE, message=FALSE}
+library(googlesheets)
+library(tidyverse)
+library(janitor)
+library(stringr)
+library(lubridate)
+library(forcats)
+devtools::load_all()
+```
+
+### Download google sheets
+
+```{r, warning=FALSE, message=FALSE}
+# googlesheets::gs_auth()
+sheet_key <- gs_ls() %>% 
+  filter(stringr::str_detect(sheet_title, 'XII|REGISTROS_')) %>% 
+  arrange(sheet_title) %>% 
+  with(sheet_key)
+
+d_inscritos <- sheet_key %>% 
+  last() %>% 
+  gs_key() %>% 
+  gs_read(verbose = FALSE) %>% 
+  clean_names() %>% 
+  set_names(abjutils::rm_accent(names(.)))
+
+d_registros <- sheet_key %>% 
+  first() %>% 
+  gs_key() %>% 
+  gs_read(verbose = FALSE) %>% 
+  clean_names() %>% 
+  set_names(abjutils::rm_accent(names(.)))
+```
+
+### Tidy
+
+```{r}
+tidy_registros <- d_registros %>% 
+  mutate(cpf = str_replace_all(cpf, '[^0-9]', '')) %>% 
+  select(cpf, situacao) %>% 
+  mutate(situacao = tolower(situacao)) %>% 
+  distinct(cpf, .keep_all = TRUE)
+
+tidy_inscritos <- d_inscritos %>% 
+  select(timestamp = indicacao_de_data_e_hora,
+         cpf, endereco, cidade, estado, cep, 
+         ocupacao = starts_with('ocupacao'),
+         confirmacao = starts_with('confirm'), 
+         sexo = starts_with('como_'),
+         obs) %>% 
+  filter(confirmacao != 'repetido', is.na(obs) | obs != 'DESISTIU') %>% 
+  select(-obs) %>% 
+  distinct(cpf, .keep_all = TRUE) %>% 
+  mutate(estado = estado %>% toupper() %>% abjutils::rm_accent(),
+         estado = if_else(str_detect(estado, 'SAO PAULO'), 'SP', estado)) %>% 
+  unite(origem, endereco, cidade, estado, sep = ', ') %>% 
+  mutate(timestamp = dmy_hms(timestamp)) %>% 
+  mutate(cpf = str_replace_all(cpf, '[^0-9]', '')) %>% 
+  mutate(confirmacao = if_else(confirmacao == 'sim', 
+                               'confirmado', 'espera')) %>% 
+  left_join(tidy_registros, 'cpf') %>% 
+  mutate(situacao = if_else(is.na(situacao), 'não registrado', situacao)) %>% 
+  mutate(sexo = if_else(sexo == 'Sr.', 'masculino', 'feminino'))
+  
+latlon <- suppressMessages(ggmap::geocode(tidy_inscritos$origem))
+```
+
+### Inscrições no tempo
+
+```{r, fig.width=11, fig.height = 5}
+p <- tidy_inscritos %>% 
+  arrange(timestamp) %>% 
+  mutate(um = 1, inscricoes = cumsum(um)) %>% 
+  ggplot(aes(x = timestamp, y = inscricoes)) +
+  geom_step() +
+  scale_x_datetime(breaks = scales::date_breaks('1 day'), 
+                   labels = scales::date_format('%b %d')) +
+  theme_bw(14) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  xlab(' ') +
+  ylab('Volume de inscrições')
+
+plotly::ggplotly(p)
+```
+
+### Endereços dos inscritos
+
+```{r, fig.width=11}
+library(leaflet)
+latlon %>% 
+  bind_cols(tidy_inscritos) %>% 
+  mutate(label = str_c(ocupacao, origem, sep = '<br/>')) %>% 
+  filter(confirmacao == 'confirmado') %>% 
+  leaflet() %>%
+  setView(lng = -50, lat = -17, zoom = 4) %>% 
+  addTiles() %>%
+  addMarkers(lng = ~lon, lat = ~lat, popup = ~label,
+             clusterOptions = markerClusterOptions())
+```
+
+### Sexo
+
+```{r}
+tidy_inscritos %>% 
+  count(sexo) %>% 
+  mutate(prop = n/sum(n)) %>% 
+  add_totals_row() %>% 
+  mutate(prop = scales::percent(prop)) %>% 
+  knitr::kable()
+```
+
+### Ocupação
+
+Proporção de inscritos por combinação de ocupações:
+
+```{r}
+tidy_inscritos %>% 
+  mutate(ocupacao = fct_lump(ocupacao, n = 12)) %>% 
+  count(ocupacao, sort = TRUE) %>% 
+  mutate(prop = n/sum(n)) %>%
+  add_totals_row() %>% 
+  mutate(prop = scales::percent(prop)) %>% 
+  knitr::kable()
+```
+
+
+Proporção de inscritos por ocupação (tem overlap, não soma 100%!).
+
+```{r, fig.width=10}
+tidy_inscritos %>% 
+  separate(ocupacao, c('a', 'b', 'c', 'd'), sep = ', ',
+           fill = 'right') %>% 
+  gather(key_ocup, val_ocup, a, b, c, d, convert = TRUE) %>% 
+  filter(!is.na(val_ocup)) %>% 
+  mutate(ntot = n_distinct(cpf)) %>% 
+  mutate(val_ocup = str_wrap(fct_lump(val_ocup, n = 8), 12)) %>%
+  group_by(val_ocup) %>% 
+  summarise(n = n_distinct(cpf), ntot = first(ntot)) %>% 
+  mutate(prop = n / ntot) %>% 
+  mutate(val_ocup = fct_reorder(val_ocup, prop, .desc = TRUE)) %>% 
+  ggplot(aes(x = val_ocup, y = prop)) +
+  geom_bar(stat = 'identity') +
+  scale_y_continuous(labels = scales::percent, limits = c(0, .45)) +
+  geom_text(aes(label = scales::percent(prop)), 
+            position = position_dodge(.9), vjust = -.2) +
+  theme_bw(14) +
+  xlab('Ocupação') +
+  ylab('Proporção de inscritos')
+
+```
+
+### Inscritos vs registrados
+
+Bacharéis em estatística vs situação no CONRE-3. Dos inscritos e bacharéis em estatística, 70% não estão registrados (ou não bateram número do CPF).
+
+```{r}
+tidy_inscritos %>% 
+  filter(str_detect(ocupacao, 'Bacharel |Estatístico')) %>% 
+  count(situacao) %>% 
+  mutate(prop = n/sum(n)) %>% 
+  add_totals_row() %>% 
+  mutate(prop = scales::percent(prop)) %>% 
+  knitr::kable()
+```
+
+
